@@ -100,14 +100,70 @@ You can also set this at the dataset level:
 DB[:things].where(name: '12345').with_mssql_unicode_strings(false).all
 ```
 
-Alternatively, when creating the migration, you can specify 'nvarchar' as the datatype:
+Alternatively, when creating the migration, you can specify `nvarchar` as the datatype:
+
+###### **_NOTE:_** You also must supply the size. By default, Sequel is only checking for `varchar` explicitly to set a default size. See patches below for inspiration.
 
 ```rb
     create_table(:things) do
       primary_key :id
-      'nvarchar(255)' :name, null: false, index: true
+      nvarchar :name, size: :max, null: false, index: true
     end
 ````
+
+A few patches of interest:
+
+- [type_literal_generic_string(column)](https://github.com/jeremyevans/sequel/blob/1c39f4d1c10fc655bd6914fffff34fa505ccc68b/lib/sequel/database/schema_methods.rb#L1019): This method defines the DB datatype when Ruby `String` is specified. We need to make it aware of `n` prefix when `mssql_unicode_strings` is enabled, and probably use `(n)varchar(max)` rather than `(n)text` for `text: true`.
+- [type_literal_specific(column)](https://github.com/jeremyevans/sequel/blob/1c39f4d1c10fc655bd6914fffff34fa505ccc68b/lib/sequel/database/schema_methods.rb#L1051): This method defines the datatype when specifying a data type that is not a generic Ruby class, such as when you use `nvarchar :name`. We need to update this to assign default string size to `nvarchar` declarations.
+
+```rb
+module Sequel
+  module MSSQL
+    module DatabaseMethods
+    
+      # Modified from: https://github.com/jeremyevans/sequel/blob/1c39f4d1c10fc655bd6914fffff34fa505ccc68b/lib/sequel/database/schema_methods.rb#L1019
+      #
+      # Triggered when defining a column using generic class `String`
+      #     String :name, size: :max
+      #
+      # Sequel uses the varchar type by default for Strings.  If a
+      # size isn't present, Sequel assumes a size of 255.  If the
+      # :fixed option is used, Sequel uses the char type.  If the
+      # :text option is used, Sequel uses the :text type.
+      #
+      # Except in our case, we want SQL Server to prefix `n` when `mssql_unicode_strings` is enabled (default).
+      # Additionally, `TEXT` and `NTEXT` are deprecated in SQL Server, and instead `NVARCHAR(MAX)` should be used.
+      #
+      def type_literal_generic_string(column)
+        if column[:text]
+          (mssql_unicode_strings ? 'n' : '') << 'varchar(max)'
+        elsif column[:fixed]
+          (mssql_unicode_strings ? 'n' : '') << "char(#{column[:size]||default_string_column_size})"
+        else
+          (mssql_unicode_strings ? 'n' : '') << "varchar(#{column[:size]||default_string_column_size})"
+        end
+      end
+    
+      # Modified from: https://github.com/jeremyevans/sequel/blob/1c39f4d1c10fc655bd6914fffff34fa505ccc68b/lib/sequel/database/schema_methods.rb#L1051
+      #
+      # Triggered when defining a column via `method_missing` route, such as when declaring `nvarchar` for the datatype, rather than `String`.
+      # Allows default handling of string size when using `nvarchar`.
+      #
+      # SQL fragment for the given type of a column if the column is not one of the
+      # generic types specified with a ruby class.
+      #
+      def type_literal_specific(column)
+        type = column[:type]
+        type = "double precision" if type.to_s == 'double'
+        column[:size] ||= default_string_column_size if type.to_s.include? 'varchar'   # <-- Changed from `type.to_s == 'varchar'
+        elements = column[:size] || column[:elements]
+        "#{type}#{literal(Array(elements)) if elements}#{' UNSIGNED' if column[:unsigned]}"
+      end
+
+    end
+  end
+end
+```
 
 # One more note about advocating for updating the Sequel MSSQL adapter
 
